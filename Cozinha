@@ -1,0 +1,156 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+#include <DHT22.h>
+
+// ======= CONFIG DA DIVISÃO =======
+const char* ROOM_NAME = "COZINHA";  
+#define IS_KITCHEN 1                // só a cozinha tem sensor de gás
+
+// Wi-Fi do Hub
+const char* HUB_SSID = "CasaHub";
+const char* HUB_PASS = "12345678";
+const uint16_t UDP_PORT = 4210;
+
+// ======= SENSOR DHT22 =======
+#define DHT_PIN 4
+DHT22 dht(DHT_PIN);
+
+// ======= PINOS =======
+#define LIGHT_PWM_PIN 5
+#define LED_OK 2
+
+// Sensor de gás usando D0
+#define GAS_PIN 34   
+
+// ======= ESTADO =======
+WiFiUDP udp;
+
+uint8_t lightLevel = 0;
+bool lightOn = false;
+
+uint32_t lastHeartbeat = 0;
+const uint32_t HEARTBEAT_MS = 1000;
+
+
+
+int levelToDuty(uint8_t lvl) {
+  static const int table[6] = {0, 40, 85, 130, 190, 255};
+  return table[constrain(lvl, 0, 5)];
+}
+
+void applyLight() {
+  int duty = lightOn ? levelToDuty(lightLevel) : 0;
+  analogWrite(LIGHT_PWM_PIN, duty);
+}
+
+void sendHeartbeat() {
+  float temperatura = dht.getTemperature();
+  float humidade    = dht.getHumidity();
+
+  if (isnan(temperatura)) temperatura = -1000;
+  if (isnan(humidade))    humidade = -1000;
+
+  bool gasDetectado = false;
+
+#if IS_KITCHEN
+  gasDetectado = (digitalRead(GAS_PIN) == HIGH);
+#endif
+
+  StaticJsonDocument<200> doc;
+  doc["id"] = ROOM_NAME;
+  doc["temp"] = temperatura;
+  doc["hum"] = humidade;
+  doc["light"] = lightOn ? lightLevel : 0;
+
+#if IS_KITCHEN
+  doc["gas"] = gasDetectado;
+#endif
+
+  char buffer[200];
+  size_t n = serializeJson(doc, buffer);
+
+  udp.beginPacket(IPAddress(192,168,4,1), UDP_PORT);
+  udp.write((uint8_t*)buffer, n);
+  udp.endPacket();
+}
+
+void handleIncoming() {
+  int packetSize = udp.parsePacket();
+  if (!packetSize) return;
+
+  char buf[200];
+  int len = udp.read(buf, sizeof(buf)-1);
+  if (len <= 0) return;
+  buf[len] = 0;
+
+  StaticJsonDocument<150> doc;
+  if (deserializeJson(doc, buf)) return;
+
+  const char* cmd = doc["cmd"] | "";
+
+  if (strcmp(cmd, "toggle") == 0) {
+    lightOn = !lightOn;
+  }
+  else if (strcmp(cmd, "set") == 0) {
+    int lvl = doc["light"] | lightLevel;
+    lightLevel = constrain(lvl, 0, 5);
+    lightOn = (lightLevel > 0);
+  }
+
+  applyLight();
+}
+
+void showConnecting() {
+  static uint32_t last = 0;
+  static bool state = false;
+
+  if (millis() - last > 300) {
+    last = millis();
+    state = !state;
+    digitalWrite(LED_OK, state ? HIGH : LOW);
+  }
+
+  static uint32_t lastPrint = 0;
+  if (millis() - lastPrint > 1000) {
+    Serial.println("CONECTANDO...");
+    lastPrint = millis();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_OK, OUTPUT);
+  digitalWrite(LED_OK, LOW);
+
+  pinMode(LIGHT_PWM_PIN, OUTPUT);
+  applyLight();
+
+#if IS_KITCHEN
+  pinMode(GAS_PIN, INPUT);    // leitura digital
+#endif
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(HUB_SSID, HUB_PASS);
+
+  udp.begin(UDP_PORT);
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    showConnecting();
+    delay(10);
+    return;
+  }
+
+  digitalWrite(LED_OK, HIGH);
+
+  handleIncoming();
+
+  uint32_t now = millis();
+  if (now - lastHeartbeat > HEARTBEAT_MS) {
+    lastHeartbeat = now;
+    sendHeartbeat();
+  }
+}
