@@ -1,0 +1,313 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// CONFIGURAÇOES DA REDE WIFI
+const char* AP_SSID = "CasaHub";
+const char* AP_PASS = "12345678";
+const uint16_t UDP_PORT = 4210;
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// Botões 
+#define BTN_UP     32
+#define BTN_DOWN   33
+#define BTN_LEFT   25
+#define BTN_RIGHT  26
+#define BTN_OK     27
+
+// Buzzer 
+#define BUZZER_PIN 14
+
+// Divisões
+enum RoomId { SALA=0, QUARTO=1, WC=2, COZINHA=3, N_ROOMS=4 };
+const char* ROOM_NAMES[N_ROOMS] = {"SALA","QUARTO","WC","COZINHA"};
+
+// ======= Estado recebido dos nós =======
+struct RoomState {
+  bool present = false;
+  IPAddress ip;
+  float temp = NAN;
+  float hum = NAN;
+  uint8_t lightLevel = 0;         // 0..5
+  bool lightOn = false;
+  bool gas = false;               // só cozinha
+  uint32_t lastSeen = 0;
+  bool gasAlarm = false;
+  bool gasSilenced = false;
+  uint32_t gasSilenceUntil = 0;
+};
+RoomState rooms[N_ROOMS];
+
+// UI
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+int currentRoom = 0;
+bool overviewMode = false;
+uint32_t okPressStart = 0;
+bool okPressing = false;
+
+// UDP
+WiFiUDP udp;
+
+// Debounce
+uint32_t lastBtnMs = 0;
+const uint16_t BTN_DEBOUNCE = 120;
+
+// Barra de intensidade da LUZ
+void drawPowerBar(uint8_t level, int x, int y, int w=80, int h=8) {
+  display.drawRect(x, y, w, h, WHITE);
+  int fill = (int)((((float)level)/5.0f) * (w-2));
+  if (fill < 0) fill = 0;
+  display.fillRect(x+1, y+1, fill, h-2, WHITE);
+}
+
+// Buzzer
+void buzzerOn(uint16_t freq = 2000) {
+  tone(BUZZER_PIN, freq);
+}
+void buzzerOff() {
+  noTone(BUZZER_PIN);
+}
+
+// Enviar comando a um nó
+void sendCommand(RoomId id, const char* cmd, int value = -999) {
+  if (!rooms[id].present) return;
+  StaticJsonDocument<128> doc;
+  doc["cmd"] = cmd; // "toggle" ou "set"
+  if (value != -999) doc["light"] = value; // 0..5
+  char buffer[128];
+  size_t n = serializeJson(doc, buffer);
+  udp.beginPacket(rooms[id].ip, UDP_PORT);
+  udp.write((uint8_t*)buffer, n);
+  udp.endPacket();
+}
+
+// UI: ecrã por divisão
+void drawRoomScreen(RoomId id) {
+  display.clearDisplay();
+  // Título centrado
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  int16_t x1,y1; uint16_t w,h;
+  display.getTextBounds(ROOM_NAMES[id], 0,0, &x1,&y1,&w,&h);
+  int tx = (SCREEN_WIDTH - w)/2;
+  display.setCursor(tx, 0);
+  display.print(ROOM_NAMES[id]);
+
+  display.setTextSize(1);
+  int y = 22;
+
+  // Luz + barra
+  display.setCursor(0, y);
+  display.print("Luz: ");
+  drawPowerBar(rooms[id].lightOn ? rooms[id].lightLevel : 0, 30, y-1, 95, 10);
+  y += 14;
+
+  // Temperatura
+  display.setCursor(0, y);
+  display.print("Temp: ");
+  if (!isnan(rooms[id].temp)) { display.print(rooms[id].temp,1); display.print(" C"); }
+  else display.print("--");
+  y += 10;
+
+  // Humidade
+  display.setCursor(0, y);
+  display.print("Hum:  ");
+  if (!isnan(rooms[id].hum)) { display.print(rooms[id].hum,0); display.print(" %"); }
+  else display.print("--");
+
+  // Cozinha: gás
+  if (id == COZINHA) {
+    y += 10;
+    display.setCursor(0, y);
+    display.print("Gas:  ");
+    bool showPerigoBlink = rooms[id].gasAlarm && (millis()/500)%2==0 && !rooms[id].gasSilenced;
+    if (rooms[id].gas) {
+      if (showPerigoBlink) {
+        display.setTextColor(BLACK, WHITE);
+        display.print("PERIGO");
+        display.setTextColor(WHITE, BLACK);
+      } else {
+        display.print("Detetado");
+      }
+    } else {
+      display.print("OK");
+    }
+  }
+
+  display.display();
+}
+
+// UI: overview com todas as divisões
+void drawOverview() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(18,0);
+  display.print("VISTA GERAL");
+
+  int y = 12;
+  for (int i=0;i<N_ROOMS;i++) {
+    display.setCursor(0,y);
+    display.print(ROOM_NAMES[i]);
+    drawPowerBar(rooms[i].lightOn ? rooms[i].lightLevel : 0, 44, y, 50, 8);
+    display.setCursor(98, y);
+    if (!isnan(rooms[i].temp)) { display.print(rooms[i].temp,0); display.print("C"); }
+    else display.print("--");
+    y += 12;
+  }
+  display.display();
+}
+
+void handleButtons() {
+  uint32_t now = millis();
+  if (now - lastBtnMs < BTN_DEBOUNCE) return;
+
+  auto pressed = [](int pin){ return digitalRead(pin)==LOW; };
+
+  // Long press OK para alternar vista geral
+  if (pressed(BTN_OK)) {
+    if (!okPressing) { okPressStart = now; okPressing = true; }
+    if (okPressing && (now - okPressStart > 2000)) {
+      overviewMode = !overviewMode;
+      lastBtnMs = now;
+      okPressing = false;
+      // beep rápido
+      buzzerOn(3000); delay(100); buzzerOff();
+    }
+  } else {
+    okPressing = false;
+  }
+
+  if (overviewMode) return;
+
+  if (pressed(BTN_UP))    { currentRoom = (currentRoom - 1 + N_ROOMS)%N_ROOMS; lastBtnMs=now; }
+  else if (pressed(BTN_DOWN)) { currentRoom = (currentRoom + 1)%N_ROOMS; lastBtnMs=now; }
+  else if (pressed(BTN_LEFT)) {
+    if (rooms[currentRoom].lightLevel > 0) {
+      rooms[currentRoom].lightLevel--;
+      rooms[currentRoom].lightOn = (rooms[currentRoom].lightLevel>0);
+      sendCommand((RoomId)currentRoom, "set", rooms[currentRoom].lightLevel);
+    }
+    lastBtnMs=now;
+  }
+  else if (pressed(BTN_RIGHT)) {
+    if (rooms[currentRoom].lightLevel < 5) {
+      rooms[currentRoom].lightLevel++;
+      rooms[currentRoom].lightOn = (rooms[currentRoom].lightLevel>0);
+      sendCommand((RoomId)currentRoom, "set", rooms[currentRoom].lightLevel);
+    }
+    lastBtnMs=now;
+  }
+  else if (pressed(BTN_OK)) {
+    if (currentRoom == COZINHA && rooms[COZINHA].gas && rooms[COZINHA].gasAlarm) {
+      rooms[COZINHA].gasSilenced = true;
+      rooms[COZINHA].gasSilenceUntil = now + 25000;
+      lastBtnMs=now;
+    } else {
+      sendCommand((RoomId)currentRoom, "toggle");
+      lastBtnMs=now;
+    }
+  }
+}
+
+void handleGasAlarm() {
+  bool anyAlarm = false;
+  uint32_t now = millis();
+  for (int i=0;i<N_ROOMS;i++) {
+    if (i != COZINHA) continue;
+    if (rooms[i].gasSilenced && now > rooms[i].gasSilenceUntil) {
+      rooms[i].gasSilenced = false;
+    }
+    rooms[i].gasAlarm = rooms[i].gas;
+    if (rooms[i].gasAlarm && !rooms[i].gasSilenced) anyAlarm = true;
+  }
+  if (anyAlarm) {
+    static uint32_t lastToggle = 0; static bool on=false;
+    if (now - lastToggle > 200) { on = !on; lastToggle = now; }
+    if (on) buzzerOn(2500); else buzzerOff();
+  } else {
+    buzzerOff();
+  }
+}
+
+void parseIncoming(const char* payload, IPAddress remote) {
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) return;
+  const char* idstr = doc["id"] | "";
+  int id = -1;
+  for (int i=0;i<N_ROOMS;i++) if (strcmp(idstr, ROOM_NAMES[i])==0) { id=i; break; }
+  if (id<0) return;
+
+  rooms[id].present = true;
+  rooms[id].ip = remote;
+  rooms[id].lastSeen = millis();
+  if (doc.containsKey("temp")) rooms[id].temp = doc["temp"].as<float>();
+  if (doc.containsKey("hum"))  rooms[id].hum  = doc["hum"].as<float>();
+  if (doc.containsKey("light")) {
+    int lvl = doc["light"].as<int>();
+    rooms[id].lightLevel = constrain(lvl,0,5);
+    rooms[id].lightOn = rooms[id].lightLevel>0;
+  }
+  if (doc.containsKey("gas")) rooms[id].gas = doc["gas"].as<bool>();
+}
+
+void setup() {
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_LEFT, INPUT_PULLUP);
+  pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pinMode(BTN_OK, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzerOff();
+
+  Serial.begin(115200);
+  Serial.println("\nCentral Hub");
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay(); display.setTextColor(WHITE);
+  display.setTextSize(2);
+  
+  display.display();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(200);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP: "); Serial.print(AP_SSID);
+  Serial.print(" IP: "); Serial.println(IP);
+
+  udp.begin(UDP_PORT);
+}
+
+void loop() {
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    char buf[512];
+    int len = udp.read(buf, sizeof(buf)-1);
+    if (len>0) { buf[len]=0; parseIncoming(buf, udp.remoteIP()); }
+  }
+
+  handleButtons();
+  handleGasAlarm();
+
+  if (overviewMode) drawOverview();
+  else              drawRoomScreen((RoomId)currentRoom);
+
+  uint32_t now = millis();
+  for (int i=0;i<N_ROOMS;i++) {
+    if (rooms[i].present && now - rooms[i].lastSeen > 5000) {
+      rooms[i].present = false;
+    }
+  }
+}
